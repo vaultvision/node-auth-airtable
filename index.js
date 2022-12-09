@@ -3,15 +3,14 @@ const path = require("path");
 const http = require('http');
 
 const express = require('express');
-const session = require("express-session");
 const logger = require('morgan');
 const createError = require('http-errors');
 const cookieParser = require('cookie-parser');
 const openidClient = require("openid-client");
+const jwt = require('jsonwebtoken');
 const fetch = require("node-fetch");
 
 // Config
-// var config = require("dotenv").config().parsed;
 require("dotenv").config();
 const config = {
     "SESSION_SECRET": process.env.SESSION_SECRET,
@@ -39,7 +38,7 @@ function getOidcClient() {
             _oidcClient = new iss.Client({
                 client_id: config.VV_CLIENT_ID,
                 client_secret: config.VV_CLIENT_SECRET,
-                redirect_uris: [config.BASE_URL + "/auth/callback"],
+                redirect_uris: [oidcCallbackUrl],
                 response_types: ['code'],
             });
             resolve(_oidcClient);
@@ -60,17 +59,12 @@ app.use(logger('dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
-app.use(session({
-    secret: config.SESSION_SECRET,
-    resave: true,
-    saveUninitialized: true,
-    httpOnly: true,
-    name: "authsess",
-    cookie: {
-        secure: true,
-        sameSite: 'none',
-    },
-}));
+
+const cookieOptions = {
+            secure: true,
+            httpOnly: true,
+            sameSite: 'none'
+        };
 
 var enableCors = function(req, res) {
   if (req.headers.origin) {
@@ -84,6 +78,58 @@ var enableCors = function(req, res) {
   res.setHeader('Access-Control-Max-Age', 60 * 60 * 24 * 30);
   res.setHeader('Allow', 'GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH');
 };
+
+//////////////////////////////////
+function verifyLookupJWT(jwtStr){
+  return p = new Promise((resolve, reject)=>{
+    jwt.verify(
+      jwtStr,
+      config.SESSION_SECRET,
+      { algorithms: ['HS256'] },
+      function (err, decoded) {
+          console.log("err", err);
+          console.log("decoded", decoded);
+          if (err) {
+            reject(err);
+          } else {
+            resolve(decoded);
+          }
+      }
+    );
+  })
+}
+
+function validateJWT(req){
+  //check in cookie first
+  const jwt_from_cookie = req.cookies.authjwt;
+
+  //check in Authorize header second
+  const jwt_from_header = req.headers.authorization;
+  // if it is a Bearer token strip out "Bearer"
+  if (jwt_from_header && jwt_from_header.toLowerCase().startsWith("bearer ")) {
+    jwt_from_header = jwt_from_header.split(" ")[1];
+  }
+
+  //pick the cookie jwt first
+  let jwtStr = "";
+  if (jwt_from_cookie) {
+    jwtStr = jwt_from_cookie;
+  } else if (jwt_from_header) {
+    jwtStr = jwt_from_header;
+  }
+  console.log("jwtStr", jwtStr);
+
+  //Verify JWT
+  return verifyLookupJWT(jwtStr)
+  .then((verifyRes)=>{
+    console.log("verifyRes", verifyRes);
+    return verifyRes;
+  })
+  .catch((err)=>{
+    throw err;
+  })
+  
+}
 
 app.options("/*", function (req, res, next) {
     enableCors(req, res);
@@ -104,26 +150,6 @@ app.get('/session/jwt', function (req, res, next) {
 });
 
 
-// API Server
-function getKey(header, callback) {
-    jwksClient.getSigningKey(header.kid, function (err, key) {
-        var signingKey = key.publicKey || key.rsaPublicKey;
-        callback(null, signingKey);
-    });
-}
-
-app.get('/logout', (req, res) => {
-    res.clearCookie("authjwt");
-    // res.clearCookie("state");
-    // res.clearCookie("nonce");
-    // res.clearCookie("pkce_code");
-
-    const u = new URL('/logout', config.VV_ISSUER_URL);
-    u.searchParams.set('VV_CLIENT_ID', config.VV_CLIENT_ID);
-    u.searchParams.set('return_to', oidcLogoutUrl);
-    res.redirect(u.toString());
-})
-
 app.get('/login', (req, res) => {
     res.redirect('/oidc/login');
 })
@@ -138,9 +164,9 @@ app.get('/oidc/login', (req, res) => {
         const codeVerifier = gens.codeVerifier();
         const codeChallenger = gens.codeChallenge(codeVerifier);
 
-        req.session.code_verifier = codeVerifier;
-        req.session.nonce = nonce;
-        req.session.state = state;
+        res.cookie("code_verifier", codeVerifier, cookieOptions);
+        res.cookie("nonce", nonce, cookieOptions);
+        res.cookie("state", state, cookieOptions);
 
         const redir = oidcClient.authorizationUrl({
             scope: 'openid email profile',
@@ -162,27 +188,29 @@ app.get('/oidc/callback', (req, res) => {
     getOidcClient().then((oidcClient) => {
         const oidcParams = oidcClient.callbackParams(req);
         oidcClient.callback(oidcCallbackUrl, oidcParams, {
-            code_verifier: req.session.code_verifier,
-            state: req.session.state,
-            nonce: req.session.nonce,
+            code_verifier: req.cookies.code_verifier,
+            state: req.cookies.state,
+            nonce: req.cookies.nonce,
         }).then((tokenSet) => {
-            req.session.sessionTokens = tokenSet;
-            req.session.claims = tokenSet.claims();
-
+            res.clearCookie("code_verifier");
+            res.clearCookie("state");
+            res.clearCookie("nonce");
             if (tokenSet.access_token) {
                 oidcClient.userinfo(tokenSet.access_token).then((userinfo) => {
-                    req.session.regenerate(function (err) {
-                        if (err) {
-                            next(err);
-                        }
-                        req.session.userinfo = userinfo;
-                        req.session.save(function (err) {
-                            if (err) {
-                                return next(err);
-                            }
-                            res.redirect(config.FRONT_SITE_URL);
-                        });
-                    });
+
+
+                  // Create token
+                  const token = jwt.sign(
+                    userinfo,
+                    config.SESSION_SECRET,
+                    {
+                      expiresIn: "24h",
+                      algorithm: 'HS256',
+                    }
+                  );
+                  res.cookie("authjwt", token, cookieOptions);
+                  res.redirect(config.FRONT_SITE_URL);
+
                 });
             } else {
                 res.redirect(config.FRONT_SITE_URL);
@@ -195,42 +223,20 @@ app.get('/oidc/callback', (req, res) => {
 });
 
 // Logout clears the cookies and then sends the users to Vault Vision to clear
-// the session, then Vault Vision will redirect the user to /auth/logout.
+// the cookie, then Vault Vision will redirect the user to /auth/logout.
 app.get('/logout', (req, res, next) => {
-    req.session.userinfo = null;
-    req.session.save(function (err) {
-        if (err) {
-            next(err);
-        }
-        req.session.regenerate(function (err) {
-            if (err) {
-                next(err);
-            }
+  res.clearCookie("authjwt");
 
-            const u = new URL('/logout', config.VV_ISSUER_URL);
-            u.searchParams.set('client_id', config.VV_CLIENT_ID);
-            u.searchParams.set('return_to', oidcLogoutUrl);
-            res.redirect(u.toString());
-        });
-    });
+  const u = new URL('/logout', config.VV_ISSUER_URL);
+  u.searchParams.set('client_id', config.VV_CLIENT_ID);
+  u.searchParams.set('return_to', oidcLogoutUrl);
+  res.redirect(u.toString());
+
 });
 
 app.get('/oidc/logout', (req, res) => {
     res.redirect(config.FRONT_SITE_URL);
 });
-
-//////////////////////////////////
-
-function validateJWT(req){
-  return p = new Promise((resolve, reject)=>{
-    if (req.session.userinfo) {
-      resolve(req.session.userinfo);
-    } else {
-      reject("Session Invalid");
-    }
-  })
-  
-}
 
 //Single record
 app.get('/v0/:baseid/:table/:record', (req, res) => {
